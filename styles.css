@@ -7,3 +7,45 @@
 .juror-dashboard-grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:16px}.juror-dashboard-card{appearance:none;text-align:left;width:100%;min-width:0;background:#fff;border:1px solid var(--line);border-radius:19px;padding:18px;color:inherit;box-shadow:0 5px 19px #172b4210;transition:transform .18s,box-shadow .18s,border-color .18s}.juror-dashboard-card:hover,.juror-dashboard-card:focus-visible{transform:translateY(-3px);box-shadow:var(--shadow);border-color:#d7b36e;outline:none}.juror-dashboard-top{display:flex;align-items:center;justify-content:space-between;gap:8px}.juror-dashboard-card h2{font:800 20px Manrope;color:#1b2b3f;margin:15px 0 4px}.juror-dashboard-card>p{font-size:12px;color:var(--muted);margin:0}.juror-open-link{font-size:11px;font-weight:800;color:#8a641d;white-space:nowrap}.juror-preview-list{display:grid;gap:6px;margin:15px 0 13px}.juror-preview-chip{display:flex;align-items:center;gap:7px;min-width:0;padding:7px 9px;border-radius:9px;background:#f5f7f9;color:#516175;font-size:11px}.juror-preview-chip b{color:#a77722}.juror-preview-chip small{margin-left:auto;color:#8a641d;font-weight:800}.juror-preview-empty{margin:15px 0 13px;padding:12px;border-radius:9px;background:#f7f8fa;color:#8a97a5;font-size:11px}.juror-dashboard-bottom{display:flex;justify-content:space-between;align-items:center;padding-top:12px;border-top:1px solid #edf0f3;color:#8290a0;font-size:11px}.juror-dashboard-bottom strong{font:800 13px Manrope;color:#9a711e}
 @media(max-width:900px){.juror-dashboard-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 @media(max-width:640px){.juror-dashboard-grid{grid-template-columns:1fr}.juror-dashboard-card{padding:16px}.juror-dashboard-card h2{font-size:18px}}
+
+/* Empates: aviso explícito, estado pendiente/resuelto y orden manual. */
+.tie-warning-list{display:grid;gap:10px;margin:18px 0 20px}
+.tie-warning{display:flex;align-items:center;gap:13px;padding:15px 17px;border:1px solid #edd9a7;border-left:5px solid #d59d2d;border-radius:15px;background:#fffaf0}
+.tie-warning.resolved{border-color:#d9e5dc;border-left-color:#23845c;background:#f6fbf7}
+.tie-warning-icon{flex:0 0 40px;width:40px;height:40px;display:grid;place-items:center;border-radius:12px;background:#f5e7c6;color:#936513;font-size:22px;font-weight:800}
+.tie-warning.resolved .tie-warning-icon{background:#e1f0e6;color:#22714f}
+.tie-warning-copy{flex:1;min-width:0}
+.tie-warning-copy>strong{display:block;color:#875f17;font-size:11px;letter-spacing:.07em;font-weight:900}
+.tie-warning.resolved .tie-warning-copy>strong{color:#246c4c}
+.tie-warning-copy p{margin:5px 0;color:#4b596b;font-size:12px;line-height:1.45}
+.tie-warning-copy small{display:block;color:#7c8793;font-size:11px;line-height:1.4;margin-top:5px}
+.tie-band-names{font-size:11px;font-weight:800;color:#35465a;overflow-wrap:anywhere}
+.tie-resolve-button{flex:0 0 auto;border:0;border-radius:10px;padding:11px 14px;background:#17334d;color:white;font-size:11px;font-weight:800;cursor:pointer}
+.tie-resolve-button:hover{background:#254c6d}
+.tie-status{flex:0 0 auto;padding:8px 10px;border-radius:9px;font-size:10px;font-weight:900;white-space:nowrap}
+.tie-status.pending{background:#f7e9c7;color:#8a6217}
+.tie-status.resolved{background:#e1f0e6;color:#22714f}
+.rank-medal.rank-tie{background:#fff2ce;border:2px solid #d4a13c;color:#875d12;font-size:18px}
+.tie-tag{display:inline-flex;align-items:center;gap:4px;margin-top:3px;padding:4px 7px;border-radius:20px;background:#fff1cf;color:#8a6113;font-size:9px;font-weight:900;letter-spacing:.06em;width:max-content}
+.card-foot .tie-foot-label{color:#966812;font-size:10px;letter-spacing:.02em}
+.tie-inline-note{margin:0 0 13px;padding:10px 12px;border:1px solid #ecd9aa;border-radius:10px;background:#fff9eb;color:#795b21;font-size:11px;line-height:1.5}
+.tie-break-modal{max-width:560px}
+.tie-modal-explainer{padding:13px 15px;border:1px solid #ecd9aa;border-radius:13px;background:#fff9eb;margin-bottom:14px}
+.tie-modal-explainer strong{color:#785516;font-size:13px}
+.tie-modal-explainer p{color:#697789;font-size:12px;line-height:1.55;margin:6px 0 0}
+.tie-order-list{list-style:none;margin:0 0 18px;padding:0;display:grid;gap:8px}
+.tie-order-row{display:flex;align-items:center;gap:11px;padding:11px 12px;border:1px solid #e3e8ed;border-radius:12px;background:#fff}
+.tie-order-position{width:29px;height:29px;flex:0 0 29px;display:grid;place-items:center;border-radius:9px;background:#edf1f5;color:#35465a;font-weight:900;font-size:12px}
+.tie-order-name{flex:1;min-width:0;color:#24364b;font-size:13px;font-weight:800;overflow-wrap:anywhere}
+.tie-order-controls{display:flex;gap:6px}
+.tie-order-controls .small-button{min-width:37px;padding:8px 10px;font-size:15px}
+.tie-order-controls .small-button:disabled{opacity:.35;cursor:not-allowed}
+.podium-tie-note{max-width:570px;margin:15px auto 0;padding:10px 13px;border:1px solid #8e7846;border-radius:10px;background:#24384a;color:#f1d99e;font-size:11px;line-height:1.5}
+@media(max-width:640px){
+  .tie-warning{align-items:flex-start;flex-wrap:wrap;padding:13px;gap:10px}
+  .tie-warning-icon{width:34px;height:34px;flex-basis:34px;font-size:19px}
+  .tie-warning-copy{width:calc(100% - 48px)}
+  .tie-resolve-button,.tie-status{margin-left:44px}
+  .tie-order-row{gap:8px;padding:9px}
+  .tie-order-name{font-size:12px}
+}

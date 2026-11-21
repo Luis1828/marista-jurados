@@ -33,21 +33,82 @@ const activeCriteria = () => state.criteria.filter((criterion) => criterion.acti
 const isAdmin = () => state.profile?.role === "admin";
 const isJuror = () => state.profile?.role === "juror";
 const bandScores = (band) => Object.fromEntries((band?.band_scores ?? []).map((item) => [item.criterion_id, Number(item.score)]));
-const averageScore = (band) => {
-  const criteria = activeCriteria();
-  if (!criteria.length) return 0;
+// El promedio usa la suma entera de todos los criterios activos. Como todas
+// las bandas comparten el mismo denominador, comparar esta suma detecta
+// empates exactos sin confundirlos con valores que sólo se redondean igual.
+const scoreTotal = (band) => {
   const scores = bandScores(band);
-  return criteria.reduce((sum, item) => sum + (Number(scores[item.id]) || 0), 0) / criteria.length;
+  return activeCriteria().reduce((sum, item) => sum + (Number(scores[item.id]) || 0), 0);
 };
-// Los jurados sólo trabajan con sus propias bandas. El RLS también limita
-// los datos entregados por Supabase; este filtro define la vista y el podio.
+const averageScore = (band) => {
+  const count = activeCriteria().length;
+  return count ? scoreTotal(band) / count : 0;
+};
+const compareBands = (a, b) => {
+  const scoreDifference = scoreTotal(b) - scoreTotal(a);
+  if (scoreDifference) return scoreDifference;
+  const aOrder = a.tie_break_order == null ? null : Number(a.tie_break_order);
+  const bOrder = b.tie_break_order == null ? null : Number(b.tie_break_order);
+  if (Number.isInteger(aOrder) && Number.isInteger(bOrder) && aOrder !== bOrder) return aOrder - bOrder;
+  return a.name.localeCompare(b.name, "es");
+};
+const sortBandList = (bands) => [...bands].sort(compareBands);
+function buildTieGroups(bands) {
+  const ordered = sortBandList(bands);
+  const groups = [];
+  for (let index = 0; index < ordered.length;) {
+    const total = scoreTotal(ordered[index]);
+    let end = index + 1;
+    while (end < ordered.length && scoreTotal(ordered[end]) === total) end += 1;
+    const members = ordered.slice(index, end);
+    if (members.length > 1) {
+      const orders = members.map((band) => band.tie_break_order == null ? null : Number(band.tie_break_order));
+      const resolved = orders.every(Number.isInteger) && new Set(orders).size === members.length &&
+        Math.min(...orders) === 1 && Math.max(...orders) === members.length;
+      groups.push({
+        scoreTotal: total,
+        average: activeCriteria().length ? total / activeCriteria().length : 0,
+        bands: members,
+        startRank: index + 1,
+        endRank: end,
+        resolved,
+      });
+    }
+    index = end;
+  }
+  return groups;
+}
 const visibleBands = () => {
   if (isJuror()) return state.bands.filter((band) => band.created_by === state.profile.id);
   if (isAdmin() && state.selectedJurorId) return state.bands.filter((band) => band.created_by === state.selectedJurorId);
   return [];
 };
-const sortedBands = () => [...visibleBands()].sort((a, b) => averageScore(b) - averageScore(a) || a.name.localeCompare(b.name, "es"));
+const sortedBands = () => sortBandList(visibleBands());
+const currentTieGroups = () => buildTieGroups(visibleBands());
+const tieGroupForBand = (band, groups = currentTieGroups()) => groups.find((group) => group.bands.some((item) => item.id === band.id)) ?? null;
 const selectedJuror = () => state.adminUsers.find((user) => user.id === state.selectedJurorId) ?? null;
+
+function tieWarningsHtml(groups) {
+  if (!groups.length) return "";
+  return `<div class="tie-warning-list">${groups.map((group) => {
+    const names = group.bands.map((band) => esc(band.name)).join(" · ");
+    const stateText = group.resolved
+      ? `El jurado ya decidió el orden. Las bandas conservan el empate de promedio.`
+      : (isJuror()
+          ? "Elige manualmente el orden. Esta decisión no modifica ninguna calificación."
+          : "Desempate pendiente: el jurado debe definir el orden desde su propia cuenta.");
+    const action = !group.resolved && isJuror()
+      ? `<button class="tie-resolve-button" data-action="resolve-tie" data-score-total="${group.scoreTotal}">Resolver empate →</button>`
+      : `<span class="tie-status ${group.resolved ? "resolved" : "pending"}">${group.resolved ? "Orden decidido" : "Pendiente"}</span>`;
+    return `<section class="tie-warning ${group.resolved ? "resolved" : "pending"}">
+      <div class="tie-warning-icon">⚖</div>
+      <div class="tie-warning-copy"><strong>${group.resolved ? "EMPATE DE PROMEDIO · ORDEN DEFINIDO" : "EMPATE DETECTADO · REQUIERE DECISIÓN"}</strong>
+        <p>${group.bands.length} bandas comparten exactamente ${group.average.toFixed(2)} / 5 y ocupan ${group.startRank === group.endRank ? `el puesto ${group.startRank}` : `los puestos ${group.startRank}–${group.endRank}`}.</p>
+        <div class="tie-band-names">${names}</div><small>${stateText}</small>
+      </div>${action}
+    </section>`;
+  }).join("")}</div>`;
+}
 const fmtDate = (value) => new Date(value).toLocaleString("es-BO", { dateStyle: "medium", timeStyle: "short" });
 
 function showToast(message, type = "success", duration = 3600) {
@@ -210,17 +271,26 @@ function renderLogin(error = "") {
   </main>`;
 }
 
-function bandCard(band, index) {
+function bandCard(band, index, groups = currentTieGroups()) {
   const rank = index + 1;
+  const tie = tieGroupForBand(band, groups);
+  const unresolvedTie = Boolean(tie && !tie.resolved);
   const medalClass = rank === 1 ? "rank-1" : rank === 2 ? "rank-2" : rank === 3 ? "rank-3" : "";
   const photo = band.photo_url ? `<img class="card-photo" src="${esc(band.photo_url)}" alt="Fotografía de ${esc(band.name)}" loading="lazy">` : `<div class="photo-placeholder">♫</div>`;
   const canEditPhoto = isJuror() ? `<button class="photo-edit" aria-label="Retomar fotografía de ${esc(band.name)}" title="Retomar fotografía" data-action="quick-retake" data-id="${band.id}">✎</button>` : "";
   const scoreMap = bandScores(band);
+  const medal = tie && unresolvedTie
+    ? `<span class="rank-medal rank-tie">⚖</span>`
+    : rank <= 3 ? `<span class="rank-medal ${medalClass}">${rank}</span>` : "";
+  const positionText = tie
+    ? (tie.resolved ? `EMPATE · Puesto ${rank}` : `EMPATE · Puestos ${tie.startRank}–${tie.endRank}`)
+    : (rank <= 3 ? ["🥇", "🥈", "🥉"][rank - 1] : `Puesto ${rank}`);
   return `<article class="band-card" data-action="open-band" data-id="${band.id}" tabindex="0" role="button" aria-label="Ver detalles de ${esc(band.name)}">
-    <div class="card-photo-wrap">${photo}${rank <= 3 ? `<span class="rank-medal ${medalClass}">${rank}</span>` : ""}${canEditPhoto}</div>
+    <div class="card-photo-wrap">${photo}${medal}${canEditPhoto}</div>
     <div class="card-body"><div class="card-title-row"><h3 class="card-title">${esc(band.name)}</h3><span class="card-average">${averageScore(band).toFixed(2)} / 5</span></div>
+      ${tie ? `<span class="tie-tag">⚖ EMPATE</span>` : ""}
       ${radarSvg(scoreMap, activeCriteria())}
-      <div class="card-foot"><span>${activeCriteria().length} criterios de habilidad</span><span>${rank <= 3 ? ["🥇","🥈","🥉"][rank - 1] : `Puesto ${rank}`}</span></div>
+      <div class="card-foot"><span>${activeCriteria().length} criterios de habilidad</span><strong class="${tie ? "tie-foot-label" : ""}">${positionText}</strong></div>
     </div>
   </article>`;
 }
@@ -228,12 +298,14 @@ function bandCard(band, index) {
 function renderAdminDashboard() {
   const jurors = state.adminUsers.filter((user) => user.role === "juror");
   const cards = jurors.map((user) => {
-    const bands = state.bands
-      .filter((band) => band.created_by === user.id)
-      .sort((a, b) => averageScore(b) - averageScore(a) || a.name.localeCompare(b.name, "es"));
+    const bands = sortBandList(state.bands.filter((band) => band.created_by === user.id));
+    const jurorTieGroups = buildTieGroups(bands);
     const leaders = bands.slice(0, 3);
     const preview = leaders.length
-      ? `<div class="juror-preview-list">${leaders.map((band, index) => `<span class="juror-preview-chip"><b>${index + 1}.</b> ${esc(band.name)} <small>${averageScore(band).toFixed(2)}</small></span>`).join("")}</div>`
+      ? `<div class="juror-preview-list">${leaders.map((band, index) => {
+          const tie = tieGroupForBand(band, jurorTieGroups);
+          return `<span class="juror-preview-chip"><b>${tie ? "⚖" : `${index + 1}.`}</b> ${esc(band.name)} <small>${averageScore(band).toFixed(2)}${tie ? " · EMPATE" : ""}</small></span>`;
+        }).join("")}</div>`
       : `<div class="juror-preview-empty">Todavía no ha registrado bandas.</div>`;
     return `<button class="juror-dashboard-card" type="button" data-action="select-juror" data-id="${user.id}">
       <div class="juror-dashboard-top"><span class="status ${user.is_active ? "active" : "inactive"}">${user.is_active ? "● Acceso habilitado" : "● Acceso deshabilitado"}</span><span class="juror-open-link">Ver evaluación →</span></div>
@@ -259,6 +331,7 @@ function renderHome() {
   }
 
   const bands = sortedBands();
+  const groups = buildTieGroups(bands);
   const juror = isAdmin() ? selectedJuror() : null;
   if (isAdmin() && !juror) {
     state.selectedJurorId = null;
@@ -267,12 +340,13 @@ function renderHome() {
   }
   const title = juror ? `Bandas de ${juror.username}` : "Mis bandas";
   const back = juror ? `<div class="backline"><button class="back-button" data-action="back-jurors">← Volver a todos los jurados</button></div>` : "";
-  const cards = bands.length ? `<div class="band-grid">${bands.map((band, index) => bandCard(band, index)).join("")}</div>` : `<div class="empty-state"><div class="empty-icon">♫</div><h3>Aún no hay bandas registradas</h3><p>${juror ? `${esc(juror.username)} todavía no ha creado bandas.` : "Registra la primera banda para iniciar tu evaluación."}</p>${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear primera banda</button>` : ""}</div>`;
+  const cards = bands.length ? `<div class="band-grid">${bands.map((band, index) => bandCard(band, index, groups)).join("")}</div>` : `<div class="empty-state"><div class="empty-icon">♫</div><h3>Aún no hay bandas registradas</h3><p>${juror ? `${esc(juror.username)} todavía no ha creado bandas.` : "Registra la primera banda para iniciar tu evaluación."}</p>${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear primera banda</button>` : ""}</div>`;
   layout(`<main class="page-wrap">
     ${back}
     <section class="hero"><div><div class="eyebrow">${juror ? "Vista individual del jurado · Sólo lectura" : "Evaluación individual"}</div><h1>${esc(title)}</h1><p>${bands.length} ${bands.length === 1 ? "banda registrada" : "bandas registradas"} · Clasificación independiente por promedio</p></div>
       ${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear banda</button>` : `<span class="step-pill">Vista de administración · Sólo lectura</span>`}
     </section>
+    ${tieWarningsHtml(groups)}
     <div class="section-head"><h2>${juror ? `Clasificación de ${esc(juror.username)}` : "Mi clasificación"}</h2><span class="muted" style="font-size:12px">No se mezclan bandas de otros jurados</span></div>
     ${cards}
     ${bands.length ? `<button class="award-cta" data-action="award"><span>✦</span> PREMIAR GANADORES ${juror ? `· ${esc(juror.username)}` : ""}<span>✦</span></button>` : ""}
@@ -283,13 +357,17 @@ function renderBandDetail() {
   const band = currentBands.find((item) => item.id === state.selectedBandId);
   if (!band) { state.screen = "home"; state.selectedBandId = null; renderHome(); return; }
   const rank = currentBands.findIndex((item) => item.id === band.id) + 1;
+  const tie = tieGroupForBand(band, buildTieGroups(currentBands));
+  const rankLabel = tie
+    ? (tie.resolved ? `Puesto ${rank} · Empate de promedio` : `Empate de promedio · Puestos ${tie.startRank}–${tie.endRank}`)
+    : (rank <= 3 ? `Puesto ${rank} · ${["Primer lugar", "Segundo lugar", "Tercer lugar"][rank-1]}` : `Puesto ${rank} de ${currentBands.length}`);
   const scores = bandScores(band);
   const rows = activeCriteria().map((criterion) => `<div class="score-row"><strong>${esc(criterion.label)}</strong><span class="stars">${"★".repeat(scores[criterion.id] || 0)}${"☆".repeat(5 - (scores[criterion.id] || 0))} <b style="color:#34465b;font-size:12px;letter-spacing:0">${scores[criterion.id] || 0}/5</b></span></div>`).join("");
   const detailBackLabel = isAdmin() ? `← Volver a bandas de ${selectedJuror()?.username ?? "jurado"}` : "← Volver a mis bandas";
   layout(`<main class="page-wrap"><div class="backline"><button class="back-button" data-action="back-home">${esc(detailBackLabel)}</button></div>
     <section class="content-card"><div class="detail-header">
       <div>${band.photo_url ? `<img class="detail-photo" src="${esc(band.photo_url)}" alt="Fotografía de ${esc(band.name)}">` : `<div class="detail-photo photo-placeholder">♫</div>`}</div>
-      <div><div class="detail-label">${rank <= 3 ? `Puesto ${rank} · ${["Primer lugar","Segundo lugar","Tercer lugar"][rank-1]}` : `Puesto ${rank} de ${currentBands.length}`}</div><h1 class="detail-title">${esc(band.name)}</h1><p class="muted" style="font-size:13px;margin:0 0 14px">Calificación promedio: <strong style="color:#9a711e">${averageScore(band).toFixed(2)} / 5</strong></p>
+      <div><div class="detail-label">${rankLabel}</div><h1 class="detail-title">${esc(band.name)}</h1><p class="muted" style="font-size:13px;margin:0 0 14px">Calificación promedio: <strong style="color:#9a711e">${averageScore(band).toFixed(2)} / 5</strong></p>${tie ? `<div class="tie-inline-note">⚖ Esta banda comparte exactamente el mismo promedio con ${tie.bands.length - 1} ${tie.bands.length - 1 === 1 ? "banda" : "bandas"}. ${tie.resolved ? "El orden de presentación fue decidido por el jurado; las calificaciones siguen empatadas." : "El orden de presentación todavía está pendiente de decisión del jurado."}</div>` : ""}
         <div class="radar-wrap">${radarSvg(scores, activeCriteria(), true)}</div>
         <div class="detail-score-table">${rows}</div>
         <div class="notes-box"><h4>Comentarios y notas adicionales</h4><p>${band.notes?.trim() ? esc(band.notes) : "No se registraron comentarios adicionales."}</p></div>
@@ -373,6 +451,7 @@ function renderAudit() {
       created: "Creó una banda", edited: "Editó una banda", deleted: "Eliminó una banda",
       user_created: "Creó un usuario", user_deleted: "Eliminó un usuario", password_changed: "Cambió una contraseña",
       access_updated: "Modificó el acceso de un usuario", criteria_created: "Creó un criterio", criteria_updated: "Modificó un criterio",
+      tie_break: "Resolvió un empate",
     };
     let details = "";
     if (["created", "edited", "deleted"].includes(log.action)) {
@@ -405,6 +484,9 @@ function renderAudit() {
       details = "Se creó una cuenta de jurado.";
     } else if (log.action === "user_deleted") {
       details = "Se eliminó la cuenta del jurado.";
+    } else if (log.action === "tie_break") {
+      const ordered = (log.details?.ordered_bands ?? []).map((band) => `${band.position}. ${band.name}`).join(" → ");
+      details = `Promedio compartido: ${Number(log.details?.average ?? 0).toFixed(2)} / 5. Orden decidido por el jurado: ${ordered}. Las calificaciones permanecen empatadas.`;
     } else if (log.action === "criteria_created") {
       details = `Nuevo criterio: ${log.details?.after?.label ?? log.target_name ?? "Sin nombre"}.`;
     } else if (log.action === "criteria_updated") {
@@ -460,11 +542,24 @@ function renderModal() {
   if (!state.modal) return;
   const m = state.modal;
   let body = "";
+  if (m.type === "tie-break") {
+    const group = currentTieGroups().find((item) => item.scoreTotal === Number(m.scoreTotal));
+    const allowedIds = new Set((group?.bands ?? []).map((band) => band.id));
+    const ids = (m.bandIds ?? []).filter((id) => allowedIds.has(id));
+    const rows = ids.map((id, index) => {
+      const band = group.bands.find((item) => item.id === id);
+      return `<li class="tie-order-row"><span class="tie-order-position">${index + 1}</span><span class="tie-order-name">${esc(band?.name ?? "Banda")}</span><div class="tie-order-controls"><button class="small-button" data-action="tie-move" data-id="${id}" data-direction="-1" aria-label="Subir" ${index === 0 ? "disabled" : ""}>↑</button><button class="small-button" data-action="tie-move" data-id="${id}" data-direction="1" aria-label="Bajar" ${index === ids.length - 1 ? "disabled" : ""}>↓</button></div></li>`;
+    }).join("");
+    body = group && ids.length === group.bands.length
+      ? `<div class="tie-modal-explainer"><strong>Las ${group.bands.length} bandas tienen el mismo promedio: ${group.average.toFixed(2)} / 5.</strong><p>Ordena las bandas con las flechas. Esta decisión sólo define la posición de presentación; no cambia las puntuaciones y el sistema seguirá mostrando el empate.</p></div><ol class="tie-order-list">${rows}</ol><div class="button-row"><button class="primary-button" data-action="save-tie-break">Guardar orden decidido</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`
+      : `<div class="form-error">El grupo de empate cambió desde que abriste esta ventana. Cierra y actualiza la página.</div><div class="button-row"><button class="secondary-button" data-action="close-modal">Cerrar</button></div>`;
+  }
   if (m.type === "new-user") body = `<form id="modal-form"><div class="field"><label for="modal-username">Nombre de usuario</label><input id="modal-username" name="username" minlength="3" maxlength="24" pattern="[a-zA-Z0-9._-]{3,24}" autocapitalize="none" required placeholder="ej. jurado01"></div><div class="field"><label for="modal-password">Contraseña inicial</label><input id="modal-password" name="password" type="password" minlength="10" required placeholder="Mínimo 10 caracteres"></div><div class="button-row"><button class="primary-button" type="submit">Crear cuenta</button><button class="secondary-button" type="button" data-action="close-modal">Cancelar</button></div></form>`;
   if (m.type === "password") body = `<form id="modal-form"><p class="muted" style="font-size:13px">Establece una nueva contraseña para <strong>${esc(m.username)}</strong>. La persona deberá utilizarla en su próximo inicio de sesión.</p><div class="field"><label for="modal-password">Nueva contraseña</label><input id="modal-password" name="password" type="password" minlength="10" required placeholder="Mínimo 10 caracteres"></div><div class="button-row"><button class="primary-button" type="submit">Actualizar contraseña</button><button class="secondary-button" type="button" data-action="close-modal">Cancelar</button></div></form>`;
   if (m.type === "confirm-access") body = `<p class="muted" style="font-size:13px">${m.active ? "¿Deseas deshabilitar" : "¿Deseas habilitar"} el acceso de <strong>${esc(m.username)}</strong>?</p><div class="button-row"><button class="primary-button" data-action="confirm-user-access">${m.active ? "Deshabilitar acceso" : "Habilitar acceso"}</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`;
   if (m.type === "confirm-delete-user") body = `<div class="confirm-panel"><h3>Eliminar cuenta</h3><p>Se eliminará la cuenta de ${esc(m.username)}. Esta operación sólo está permitida cuando no tiene bandas registradas. Para conservar evaluaciones existentes, deshabilita el acceso en lugar de eliminar la cuenta.</p></div><div class="button-row"><button class="danger-button" data-action="confirm-delete-user">Eliminar cuenta</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`;
-  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal" style="max-width:480px"><div class="modal-head"><h2>${m.type === "new-user" ? "Crear usuario" : m.type === "password" ? "Cambiar contraseña" : m.type === "confirm-access" ? "Administrar acceso" : "Confirmar eliminación"}</h2><button class="modal-close" data-action="close-modal">×</button></div>${body}</section></div>`);
+  const modalTitle = m.type === "tie-break" ? "Resolver empate" : m.type === "new-user" ? "Crear usuario" : m.type === "password" ? "Cambiar contraseña" : m.type === "confirm-access" ? "Administrar acceso" : "Confirmar eliminación";
+  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal ${m.type === "tie-break" ? "tie-break-modal" : ""}" style="max-width:${m.type === "tie-break" ? "560px" : "480px"}"><div class="modal-head"><h2>${modalTitle}</h2><button class="modal-close" data-action="close-modal">×</button></div>${body}</section></div>`);
 }
 
 function renderAward() {
@@ -472,8 +567,10 @@ function renderAward() {
   const bands = sortedBands().slice(0, 3);
   const third = bands[2], second = bands[1], first = bands[0];
   const juryLabel = isAdmin() ? selectedJuror()?.username : state.profile.username;
+  const podiumHasTie = currentTieGroups().some((group) => group.resolved && group.startRank <= 3);
+  const podiumTieNote = podiumHasTie ? `<div class="podium-tie-note">⚖ Hay bandas con el mismo promedio. El podio respeta el orden decidido por el jurado, pero las calificaciones siguen empatadas.</div>` : "";
   const podiumSlot = (band, place, className, emoji) => `<div class="podium-slot ${className}" id="podium-${place}"><img class="podium-photo" src="${esc(band?.photo_url ?? "")}" alt="" onerror="this.style.opacity='0'"><div class="podium-name">${esc(band?.name ?? "Por definir")}</div><div class="podium-block">${emoji}</div></div>`;
-  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal podium-modal"><div class="award-subtitle">Festival Intercolegial · ${esc(juryLabel ? `Evaluación de ${juryLabel}` : "Resultados")}</div><h2>¡Llegó el momento de premiar!</h2><p>El podio de este jurado se revela de menor a mayor posición.</p><div class="podium-stage">${podiumSlot(second, 2, "second", "2.º")}${podiumSlot(first, 1, "first", "1.º")}${podiumSlot(third, 3, "third", "3.º")}</div><div class="spin-note" id="award-caption">Preparando resultados…</div><div class="podium-actions"><button class="primary-button" data-action="close-award" disabled id="award-close">Cerrar ceremonia</button></div></section></div>`);
+  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal podium-modal"><div class="award-subtitle">Festival Intercolegial · ${esc(juryLabel ? `Evaluación de ${juryLabel}` : "Resultados")}</div><h2>¡Llegó el momento de premiar!</h2><p>El podio de este jurado se revela de menor a mayor posición.</p><div class="podium-stage">${podiumSlot(second, 2, "second", "2.º")}${podiumSlot(first, 1, "first", "1.º")}${podiumSlot(third, 3, "third", "3.º")}</div>${podiumTieNote}<div class="spin-note" id="award-caption">Preparando resultados…</div><div class="podium-actions"><button class="primary-button" data-action="close-award" disabled id="award-close">Cerrar ceremonia</button></div></section></div>`);
   window.setTimeout(() => { document.getElementById("podium-3")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = third ? `Tercer lugar: ${third.name}` : "Tercer lugar"; }, 800);
   window.setTimeout(() => { document.getElementById("podium-2")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = second ? `Segundo lugar: ${second.name}` : "Segundo lugar"; }, 3900);
   window.setTimeout(() => { document.getElementById("podium-1")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = first ? `¡Primer lugar: ${first.name}!` : "Primer lugar"; }, 7200);
@@ -539,7 +636,7 @@ async function refreshData() {
   if (!state.profile) return;
   const [{ data: criteria, error: criteriaError }, { data: bands, error: bandsError }] = await Promise.all([
     supabase.from("scoring_criteria").select("id,label,sort_order,active").order("sort_order"),
-    supabase.from("bands").select("id,name,photo_path,notes,created_by,created_at,updated_at,band_scores(criterion_id,score)").order("created_at", { ascending: false }),
+    supabase.from("bands").select("id,name,photo_path,notes,created_by,created_at,updated_at,tie_break_order,band_scores(criterion_id,score)").order("created_at", { ascending: false }),
   ]);
   if (criteriaError) throw criteriaError;
   if (bandsError) throw bandsError;
@@ -774,6 +871,45 @@ async function reorderCriterion(id, direction) {
   await refreshData(); await fetchAuditLogs(); renderCriteria();
 }
 
+function openTieBreak(scoreTotalValue) {
+  if (!isJuror()) {
+    showToast("Sólo el jurado puede decidir el orden de sus propios empates.", "warning");
+    return;
+  }
+  const group = currentTieGroups().find((item) => item.scoreTotal === Number(scoreTotalValue));
+  if (!group || group.bands.length < 2) {
+    showToast("El empate ya no existe. Actualiza la clasificación.", "warning");
+    return;
+  }
+  state.modal = { type: "tie-break", scoreTotal: group.scoreTotal, bandIds: group.bands.map((band) => band.id) };
+  renderModal();
+}
+
+async function saveTieBreak() {
+  const modal = state.modal;
+  if (!isJuror() || modal?.type !== "tie-break") return;
+  const currentGroup = currentTieGroups().find((item) => item.scoreTotal === Number(modal.scoreTotal));
+  if (!currentGroup || currentGroup.bands.length !== modal.bandIds.length ||
+      !currentGroup.bands.every((band) => modal.bandIds.includes(band.id))) {
+    showToast("El grupo de empate cambió. Actualiza la página y vuelve a intentarlo.", "error");
+    return;
+  }
+  const saveButton = document.querySelector('[data-action="save-tie-break"]');
+  if (saveButton) { saveButton.disabled = true; saveButton.textContent = "Guardando decisión…"; }
+  try {
+    const { error } = await supabase.rpc("save_tie_break_order", { p_band_ids: modal.bandIds });
+    if (error) throw error;
+    state.modal = null;
+    await refreshData();
+    await fetchAuditLogs();
+    render();
+    showToast("Orden de desempate guardado. Las bandas siguen empatadas en promedio.");
+  } catch (error) {
+    showToast(error.message ?? "No se pudo guardar el desempate.", "error", 6000);
+    if (state.modal?.type === "tie-break") renderModal();
+  }
+}
+
 async function handleClick(event) {
   const actionNode = event.target.closest("[data-action]");
   if (!actionNode) return;
@@ -785,6 +921,18 @@ async function handleClick(event) {
   else if (action === "back-jurors") { state.selectedJurorId = null; state.selectedBandId = null; state.screen = "home"; render(); }
   else if (action === "select-juror") { if (!isAdmin() || !state.adminUsers.some((user) => user.id === id)) return; state.selectedJurorId = id; state.selectedBandId = null; state.screen = "home"; render(); }
   else if (action === "refresh-dashboard") { try { await refreshData(); await fetchAdminUsers(); renderHome(); showToast("Evaluaciones actualizadas."); } catch (error) { showToast(error.message, "error"); } }
+  else if (action === "resolve-tie") openTieBreak(actionNode.dataset.scoreTotal);
+  else if (action === "tie-move") {
+    if (state.modal?.type !== "tie-break") return;
+    const from = state.modal.bandIds.indexOf(id);
+    const to = from + Number(actionNode.dataset.direction);
+    if (from < 0 || to < 0 || to >= state.modal.bandIds.length) return;
+    const reordered = [...state.modal.bandIds];
+    [reordered[from], reordered[to]] = [reordered[to], reordered[from]];
+    state.modal.bandIds = reordered;
+    renderModal();
+  }
+  else if (action === "save-tie-break") saveTieBreak();
   else if (action === "edit-band") openEditWizard(id);
   else if (action === "cancel-wizard") {
     const editingId = state.wizard?.id;
@@ -830,7 +978,16 @@ async function handleClick(event) {
   else if (action === "quick-capture") captureFromVideo("quick-camera-video", (blob, preview) => { state.quickRetake.blob = blob; state.quickRetake.preview = preview; stopCamera(); renderModal(); });
   else if (action === "quick-retake-again") { state.quickRetake.preview = ""; state.quickRetake.blob = null; state.quickRetake.error = ""; renderModal(); }
   else if (action === "quick-save-photo") quickRetakeSave();
-  else if (action === "award") { if (!sortedBands().length) { showToast("Todavía no hay bandas para premiar.", "warning"); return; } renderAward(); }
+  else if (action === "award") {
+    if (!sortedBands().length) { showToast("Todavía no hay bandas para premiar.", "warning"); return; }
+    const pendingTopTie = currentTieGroups().find((group) => !group.resolved && group.startRank <= 3);
+    if (pendingTopTie) {
+      if (isJuror()) openTieBreak(pendingTopTie.scoreTotal);
+      else showToast("Hay un empate pendiente que el jurado debe resolver antes de premiar.", "warning", 6000);
+      return;
+    }
+    renderAward();
+  }
   else if (action === "close-award") { document.querySelector(".modal-backdrop")?.remove(); }
   else if (action === "new-user") { state.modal = { type: "new-user" }; renderModal(); }
   else if (action === "close-modal") { state.modal = null; document.querySelector(".modal-backdrop")?.remove(); }
