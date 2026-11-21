@@ -49,3 +49,23 @@
   .tie-order-row{gap:8px;padding:9px}
   .tie-order-name{font-size:12px}
 }
+
+/* Ajustes de visibilidad de empates en pantallas pequeñas y panel admin. */
+.juror-tie-summary{display:grid;gap:4px;margin:12px 0 4px;padding:10px 11px;border:1px solid #edd9a7;border-left:4px solid #d59d2d;border-radius:10px;background:#fff9eb;color:#795b21;min-width:0}
+.juror-tie-summary strong{font-size:10px;letter-spacing:.06em;font-weight:900;color:#875f17}
+.juror-tie-summary span{font-size:10px;line-height:1.45;color:#6f5b35;overflow-wrap:anywhere}
+.tie-tag{white-space:normal;max-width:100%;line-height:1.35}
+@media(max-width:640px){
+  .tie-warning-list{display:grid!important;visibility:visible!important;opacity:1!important;width:100%;margin:12px 0 17px;gap:9px}
+  .tie-warning{display:grid;grid-template-columns:36px minmax(0,1fr);align-items:start;gap:9px 10px;width:100%;padding:12px;border-radius:13px}
+  .tie-warning-icon{grid-column:1;grid-row:1;width:34px;height:34px;flex:0 0 34px}
+  .tie-warning-copy{grid-column:2;grid-row:1;width:auto;min-width:0;max-width:100%;flex:none}
+  .tie-warning-copy>strong{font-size:10px;line-height:1.4;overflow-wrap:anywhere}
+  .tie-warning-copy p{font-size:12px;line-height:1.45}
+  .tie-warning-copy small{font-size:11px}
+  .tie-resolve-button,.tie-status{grid-column:2;grid-row:2;margin:0;justify-self:start;max-width:100%;white-space:normal}
+  .tie-tag{display:inline-flex;font-size:10px;padding:5px 8px;margin:6px 0 2px}
+  .juror-tie-summary{margin:10px 0 3px;padding:10px}
+  .juror-tie-summary strong{font-size:10px}
+  .juror-tie-summary span{font-size:11px}
+}

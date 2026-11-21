@@ -288,7 +288,7 @@ function bandCard(band, index, groups = currentTieGroups()) {
   return `<article class="band-card" data-action="open-band" data-id="${band.id}" tabindex="0" role="button" aria-label="Ver detalles de ${esc(band.name)}">
     <div class="card-photo-wrap">${photo}${medal}${canEditPhoto}</div>
     <div class="card-body"><div class="card-title-row"><h3 class="card-title">${esc(band.name)}</h3><span class="card-average">${averageScore(band).toFixed(2)} / 5</span></div>
-      ${tie ? `<span class="tie-tag">⚖ EMPATE</span>` : ""}
+      ${tie ? `<span class="tie-tag">⚖ ${tie.resolved ? "EMPATE · ORDEN DEFINIDO" : "EMPATE DETECTADO"}</span>` : ""}
       ${radarSvg(scoreMap, activeCriteria())}
       <div class="card-foot"><span>${activeCriteria().length} criterios de habilidad</span><strong class="${tie ? "tie-foot-label" : ""}">${positionText}</strong></div>
     </div>
@@ -307,10 +307,14 @@ function renderAdminDashboard() {
           return `<span class="juror-preview-chip"><b>${tie ? "⚖" : `${index + 1}.`}</b> ${esc(band.name)} <small>${averageScore(band).toFixed(2)}${tie ? " · EMPATE" : ""}</small></span>`;
         }).join("")}</div>`
       : `<div class="juror-preview-empty">Todavía no ha registrado bandas.</div>`;
+    const tieSummary = jurorTieGroups.length
+      ? `<div class="juror-tie-summary" role="note"><strong>⚖ ${jurorTieGroups.length === 1 ? "EMPATE DETECTADO" : `${jurorTieGroups.length} EMPATES DETECTADOS`}</strong><span>${jurorTieGroups.map((group) => `${group.bands.map((band) => esc(band.name)).join(" / ")} · ${group.average.toFixed(2)} / 5${group.resolved ? " · orden definido" : " · pendiente"}`).join("; ")}</span></div>`
+      : "";
     return `<button class="juror-dashboard-card" type="button" data-action="select-juror" data-id="${user.id}">
       <div class="juror-dashboard-top"><span class="status ${user.is_active ? "active" : "inactive"}">${user.is_active ? "● Acceso habilitado" : "● Acceso deshabilitado"}</span><span class="juror-open-link">Ver evaluación →</span></div>
       <h2>${esc(user.username)}</h2>
       <p>${bands.length} ${bands.length === 1 ? "banda registrada" : "bandas registradas"}</p>
+      ${tieSummary}
       ${preview}
       <div class="juror-dashboard-bottom"><span>Mejor promedio</span><strong>${bands.length ? `${averageScore(bands[0]).toFixed(2)} / 5` : "—"}</strong></div>
     </button>`;
