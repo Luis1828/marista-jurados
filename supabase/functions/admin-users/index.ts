@@ -7,22 +7,85 @@ import {
   writeAudit,
 } from "../_shared/common.ts";
 
+type SupabaseLikeError = {
+  message?: string;
+  code?: string;
+  details?: string;
+  hint?: string;
+  status?: number;
+};
+
+function describeError(error: unknown): SupabaseLikeError & { name?: string } {
+  if (error instanceof Error) {
+    const candidate = error as Error & SupabaseLikeError;
+    return {
+      name: candidate.name,
+      message: candidate.message,
+      code: candidate.code,
+      details: candidate.details,
+      hint: candidate.hint,
+      status: candidate.status,
+    };
+  }
+  if (error && typeof error === "object") {
+    const candidate = error as SupabaseLikeError & { name?: string };
+    return {
+      name: candidate.name,
+      message: candidate.message ?? "Error de Supabase sin mensaje.",
+      code: candidate.code,
+      details: candidate.details,
+      hint: candidate.hint,
+      status: candidate.status,
+    };
+  }
+  return { message: String(error ?? "Error desconocido.") };
+}
+
+function errorStatus(info: SupabaseLikeError & { name?: string }): number {
+  const message = (info.message ?? "").toLowerCase();
+  if (info.status && info.status >= 400 && info.status <= 599) return info.status;
+  if (info.code === "23505") return 409;
+  if (info.code === "42501" || /sesión|permiso|deshabilitada|no tienes/i.test(message)) return 403;
+  if (info.name === "SyntaxError") return 400;
+  return 500;
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: corsHeaders });
   if (req.method !== "POST") return jsonResponse({ error: "Método no permitido." }, 405);
 
+  let actionForLog = "unknown";
   try {
-    const { profile: actor, serviceClient: db } = await authorizeRequest(req, "admin");
+    const { profile: actor, userClient, serviceClient: db } = await authorizeRequest(req, "admin");
     const payload = await req.json();
     const action = String(payload?.action ?? "");
+    actionForLog = action || "empty";
 
     if (action === "list") {
+      // Para la lectura de la lista usamos el JWT del administrador, no la clave
+      // privilegiada. La política profiles_select_self_or_admin permite que sólo
+      // un admin activo consulte los perfiles; la política bands_select_owner_or_admin
+      // permite al administrador leer todas las bandas. Así no dependemos de que la función tenga una
+      // service key con privilegios de lectura de tablas.
       const [{ data: users, error: usersError }, { data: bands, error: bandsError }] = await Promise.all([
-        db.from("user_profiles").select("id, username, role, is_active, created_at").eq("role", "juror").order("username"),
-        db.from("bands").select("id, name, created_at, created_by").order("created_at", { ascending: false }),
+        userClient.from("user_profiles")
+          .select("id, username, role, is_active, created_at")
+          .eq("role", "juror")
+          .order("username"),
+        userClient.from("bands")
+          .select("id, name, created_at, created_by")
+          .order("created_at", { ascending: false }),
       ]);
-      if (usersError) throw usersError;
-      if (bandsError) throw bandsError;
+
+      if (usersError) {
+        console.error("[admin-users:list] user_profiles query failed", usersError);
+        throw new Error(`No se pudieron consultar los usuarios (${usersError.code ?? "sin código"}): ${usersError.message}`);
+      }
+      if (bandsError) {
+        console.error("[admin-users:list] bands query failed", bandsError);
+        throw new Error(`No se pudieron consultar las bandas (${bandsError.code ?? "sin código"}): ${bandsError.message}`);
+      }
+
       const grouped = new Map<string, Array<{ id: string; name: string; created_at: string }>>();
       for (const band of bands ?? []) {
         if (!band.created_by) continue;
@@ -38,12 +101,19 @@ Deno.serve(async (req: Request) => {
       return jsonResponse({ error: "El usuario debe tener entre 3 y 24 caracteres: letras, números, punto, guion o guion bajo." }, 400);
     }
 
-    const { data: target, error: targetError } = await db
+    // La búsqueda del perfil objetivo se hace con el JWT del administrador.
+    // La política profiles_select_self_or_admin permite esta lectura sólo a un
+    // administrador activo. El cliente service-role queda para Auth Admin y
+    // escrituras explícitamente concedidas al rol service_role.
+    const { data: target, error: targetError } = await userClient
       .from("user_profiles")
       .select("id, username, role, is_active")
       .eq("username", username)
       .maybeSingle();
-    if (targetError) throw targetError;
+    if (targetError) {
+      console.error("[admin-users] target profile query failed", targetError);
+      throw new Error(`No se pudo consultar la cuenta ${username} (${targetError.code ?? "sin código"}): ${targetError.message}`);
+    }
     if (target && target.role !== "juror") return jsonResponse({ error: "Sólo se pueden administrar cuentas de jurados." }, 403);
 
     if (action === "create") {
@@ -94,6 +164,19 @@ Deno.serve(async (req: Request) => {
     }
 
     if (action === "delete") {
+      // No eliminar una cuenta que conserva bandas: created_by permite mantener
+      // sus bandas agrupadas y su podio histórico. Deshabilitar el acceso es la
+      // opción correcta cuando ya hay evaluaciones registradas.
+      const { count: ownedBandCount, error: ownedBandsError } = await userClient
+        .from("bands")
+        .select("id", { count: "exact", head: true })
+        .eq("created_by", target.id);
+      if (ownedBandsError) throw ownedBandsError;
+      if ((ownedBandCount ?? 0) > 0) {
+        return jsonResponse({
+          error: `No se puede eliminar la cuenta ${username} porque tiene ${ownedBandCount} banda(s) registrada(s). Deshabilita su acceso para conservar su clasificación y podio.`,
+        }, 409);
+      }
       const { error } = await db.auth.admin.deleteUser(target.id);
       if (error) throw error;
       await writeAudit(db, actor, "user_deleted", "user", target.id, username, { username, note: "Cuenta eliminada por administrador." });
@@ -102,8 +185,18 @@ Deno.serve(async (req: Request) => {
 
     return jsonResponse({ error: "Acción desconocida." }, 400);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Error interno.";
-    const status = /sesión|permiso|deshabilitada|no tienes/i.test(message) ? 403 : 400;
-    return jsonResponse({ error: message }, status);
+    const info = describeError(error);
+    // No se registran contraseñas, tokens ni cabeceras de autenticación.
+    console.error("[admin-users] request failed", {
+      action: actionForLog,
+      name: info.name,
+      message: info.message,
+      code: info.code,
+      details: info.details,
+      hint: info.hint,
+      status: info.status,
+    });
+    const message = info.message || "Error interno en admin-users.";
+    return jsonResponse({ error: message, code: info.code ?? null }, errorStatus(info));
   }
 });

@@ -17,6 +17,7 @@ const state = {
   criteria: [],
   adminUsers: [],
   auditLogs: [],
+  selectedJurorId: null,
   selectedBandId: null,
   wizard: null,
   cameraStream: null,
@@ -38,7 +39,15 @@ const averageScore = (band) => {
   const scores = bandScores(band);
   return criteria.reduce((sum, item) => sum + (Number(scores[item.id]) || 0), 0) / criteria.length;
 };
-const sortedBands = () => [...state.bands].sort((a, b) => averageScore(b) - averageScore(a) || a.name.localeCompare(b.name, "es"));
+// Los jurados sólo trabajan con sus propias bandas. El RLS también limita
+// los datos entregados por Supabase; este filtro define la vista y el podio.
+const visibleBands = () => {
+  if (isJuror()) return state.bands.filter((band) => band.created_by === state.profile.id);
+  if (isAdmin() && state.selectedJurorId) return state.bands.filter((band) => band.created_by === state.selectedJurorId);
+  return [];
+};
+const sortedBands = () => [...visibleBands()].sort((a, b) => averageScore(b) - averageScore(a) || a.name.localeCompare(b.name, "es"));
+const selectedJuror = () => state.adminUsers.find((user) => user.id === state.selectedJurorId) ?? null;
 const fmtDate = (value) => new Date(value).toLocaleString("es-BO", { dateStyle: "medium", timeStyle: "short" });
 
 function showToast(message, type = "success", duration = 3600) {
@@ -216,29 +225,71 @@ function bandCard(band, index) {
   </article>`;
 }
 
-function renderHome() {
-  const bands = sortedBands();
-  const cards = bands.length ? `<div class="band-grid">${bands.map((band, index) => bandCard(band, index)).join("")}</div>` : `<div class="empty-state"><div class="empty-icon">♫</div><h3>Aún no hay bandas registradas</h3><p>${isAdmin() ? "Cuando los jurados creen bandas aparecerán en este panel." : "Registra la primera banda para iniciar la evaluación del festival."}</p>${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear primera banda</button>` : ""}</div>`;
+function renderAdminDashboard() {
+  const jurors = state.adminUsers.filter((user) => user.role === "juror");
+  const cards = jurors.map((user) => {
+    const bands = state.bands
+      .filter((band) => band.created_by === user.id)
+      .sort((a, b) => averageScore(b) - averageScore(a) || a.name.localeCompare(b.name, "es"));
+    const leaders = bands.slice(0, 3);
+    const preview = leaders.length
+      ? `<div class="juror-preview-list">${leaders.map((band, index) => `<span class="juror-preview-chip"><b>${index + 1}.</b> ${esc(band.name)} <small>${averageScore(band).toFixed(2)}</small></span>`).join("")}</div>`
+      : `<div class="juror-preview-empty">Todavía no ha registrado bandas.</div>`;
+    return `<button class="juror-dashboard-card" type="button" data-action="select-juror" data-id="${user.id}">
+      <div class="juror-dashboard-top"><span class="status ${user.is_active ? "active" : "inactive"}">${user.is_active ? "● Acceso habilitado" : "● Acceso deshabilitado"}</span><span class="juror-open-link">Ver evaluación →</span></div>
+      <h2>${esc(user.username)}</h2>
+      <p>${bands.length} ${bands.length === 1 ? "banda registrada" : "bandas registradas"}</p>
+      ${preview}
+      <div class="juror-dashboard-bottom"><span>Mejor promedio</span><strong>${bands.length ? `${averageScore(bands[0]).toFixed(2)} / 5` : "—"}</strong></div>
+    </button>`;
+  }).join("");
+
   layout(`<main class="page-wrap">
-    <section class="hero"><div><div class="eyebrow">Evaluación en vivo</div><h1>Bandas participantes</h1><p>${bands.length} ${bands.length === 1 ? "banda registrada" : "bandas registradas"} · Ordenadas por calificación promedio</p></div>
-      ${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear banda</button>` : `<span class="step-pill">Vista de administración · Sólo lectura</span>`}
-    </section>
-    <div class="section-head"><h2>Clasificación general</h2><span class="muted" style="font-size:12px">Actualizada al consultar la base de datos</span></div>
-    ${cards}
-    ${bands.length ? `<button class="award-cta" data-action="award"><span>✦</span> PREMIAR GANADORES <span>✦</span></button>` : ""}
+    <section class="hero"><div><div class="eyebrow">Panel de administración</div><h1>Evaluaciones por jurado</h1><p>Cada jurado tiene su propia clasificación y su propio podio. Selecciona uno para consultar exactamente sus bandas.</p></div><button class="secondary-button" data-action="refresh-dashboard">↻ Actualizar datos</button></section>
+    <div class="section-head"><h2>Jurados</h2><span class="muted" style="font-size:12px">${jurors.length} cuentas</span></div>
+    <div class="juror-dashboard-grid">${cards || `<div class="empty-state"><h3>Aún no hay jurados</h3><p>Crea las cuentas desde Usuarios para que aparezcan sus evaluaciones.</p><button class="primary-button" data-action="go-users">Administrar usuarios</button></div>`}</div>
+    <p class="form-hint">La administración puede consultar las evaluaciones, pero no editar ni eliminar bandas ni cambiar puntuaciones.</p>
   </main>`);
 }
 
+function renderHome() {
+  if (isAdmin() && !state.selectedJurorId) {
+    renderAdminDashboard();
+    return;
+  }
+
+  const bands = sortedBands();
+  const juror = isAdmin() ? selectedJuror() : null;
+  if (isAdmin() && !juror) {
+    state.selectedJurorId = null;
+    renderAdminDashboard();
+    return;
+  }
+  const title = juror ? `Bandas de ${juror.username}` : "Mis bandas";
+  const back = juror ? `<div class="backline"><button class="back-button" data-action="back-jurors">← Volver a todos los jurados</button></div>` : "";
+  const cards = bands.length ? `<div class="band-grid">${bands.map((band, index) => bandCard(band, index)).join("")}</div>` : `<div class="empty-state"><div class="empty-icon">♫</div><h3>Aún no hay bandas registradas</h3><p>${juror ? `${esc(juror.username)} todavía no ha creado bandas.` : "Registra la primera banda para iniciar tu evaluación."}</p>${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear primera banda</button>` : ""}</div>`;
+  layout(`<main class="page-wrap">
+    ${back}
+    <section class="hero"><div><div class="eyebrow">${juror ? "Vista individual del jurado · Sólo lectura" : "Evaluación individual"}</div><h1>${esc(title)}</h1><p>${bands.length} ${bands.length === 1 ? "banda registrada" : "bandas registradas"} · Clasificación independiente por promedio</p></div>
+      ${isJuror() ? `<button class="primary-button" data-action="new-band">＋ Crear banda</button>` : `<span class="step-pill">Vista de administración · Sólo lectura</span>`}
+    </section>
+    <div class="section-head"><h2>${juror ? `Clasificación de ${esc(juror.username)}` : "Mi clasificación"}</h2><span class="muted" style="font-size:12px">No se mezclan bandas de otros jurados</span></div>
+    ${cards}
+    ${bands.length ? `<button class="award-cta" data-action="award"><span>✦</span> PREMIAR GANADORES ${juror ? `· ${esc(juror.username)}` : ""}<span>✦</span></button>` : ""}
+  </main>`);
+}
 function renderBandDetail() {
-  const band = state.bands.find((item) => item.id === state.selectedBandId);
-  if (!band) { state.screen = "home"; renderHome(); return; }
-  const rank = sortedBands().findIndex((item) => item.id === band.id) + 1;
+  const currentBands = sortedBands();
+  const band = currentBands.find((item) => item.id === state.selectedBandId);
+  if (!band) { state.screen = "home"; state.selectedBandId = null; renderHome(); return; }
+  const rank = currentBands.findIndex((item) => item.id === band.id) + 1;
   const scores = bandScores(band);
   const rows = activeCriteria().map((criterion) => `<div class="score-row"><strong>${esc(criterion.label)}</strong><span class="stars">${"★".repeat(scores[criterion.id] || 0)}${"☆".repeat(5 - (scores[criterion.id] || 0))} <b style="color:#34465b;font-size:12px;letter-spacing:0">${scores[criterion.id] || 0}/5</b></span></div>`).join("");
-  layout(`<main class="page-wrap"><div class="backline"><button class="back-button" data-action="back-home">← Volver a todas las bandas</button></div>
+  const detailBackLabel = isAdmin() ? `← Volver a bandas de ${selectedJuror()?.username ?? "jurado"}` : "← Volver a mis bandas";
+  layout(`<main class="page-wrap"><div class="backline"><button class="back-button" data-action="back-home">${esc(detailBackLabel)}</button></div>
     <section class="content-card"><div class="detail-header">
       <div>${band.photo_url ? `<img class="detail-photo" src="${esc(band.photo_url)}" alt="Fotografía de ${esc(band.name)}">` : `<div class="detail-photo photo-placeholder">♫</div>`}</div>
-      <div><div class="detail-label">${rank <= 3 ? `Puesto ${rank} · ${["Primer lugar","Segundo lugar","Tercer lugar"][rank-1]}` : `Puesto ${rank} de ${state.bands.length}`}</div><h1 class="detail-title">${esc(band.name)}</h1><p class="muted" style="font-size:13px;margin:0 0 14px">Calificación promedio: <strong style="color:#9a711e">${averageScore(band).toFixed(2)} / 5</strong></p>
+      <div><div class="detail-label">${rank <= 3 ? `Puesto ${rank} · ${["Primer lugar","Segundo lugar","Tercer lugar"][rank-1]}` : `Puesto ${rank} de ${currentBands.length}`}</div><h1 class="detail-title">${esc(band.name)}</h1><p class="muted" style="font-size:13px;margin:0 0 14px">Calificación promedio: <strong style="color:#9a711e">${averageScore(band).toFixed(2)} / 5</strong></p>
         <div class="radar-wrap">${radarSvg(scores, activeCriteria(), true)}</div>
         <div class="detail-score-table">${rows}</div>
         <div class="notes-box"><h4>Comentarios y notas adicionales</h4><p>${band.notes?.trim() ? esc(band.notes) : "No se registraron comentarios adicionales."}</p></div>
@@ -375,7 +426,7 @@ function renderAudit() {
 function renderUsers() {
   const cards = state.adminUsers.map((user) => `<article class="user-card"><div><div class="user-name">${esc(user.username)}</div><div class="user-meta">Cuenta creada: ${fmtDate(user.created_at)}</div><div style="margin-top:7px"><span class="status ${user.is_active ? "active" : "inactive"}">${user.is_active ? "● Acceso habilitado" : "● Acceso deshabilitado"}</span></div></div>
     <div><div class="user-meta" style="margin:0 0 7px">Bandas registradas por este usuario (${user.bands.length})</div><div class="user-band-list">${user.bands.length ? user.bands.map((band) => `<span class="user-band-chip">${esc(band.name)}</span>`).join("") : `<span class="muted" style="font-size:11px">Todavía no ha creado bandas</span>`}</div></div>
-    <div class="user-actions"><button class="small-button" data-action="user-password" data-id="${user.id}" data-username="${esc(user.username)}">Contraseña</button><button class="small-button" data-action="user-access" data-id="${user.id}" data-username="${esc(user.username)}" data-active="${user.is_active}">${user.is_active ? "Deshabilitar" : "Habilitar"}</button><button class="small-button danger" data-action="user-delete" data-id="${user.id}" data-username="${esc(user.username)}">Eliminar</button></div>
+    <div class="user-actions"><button class="small-button" data-action="select-juror" data-id="${user.id}">Ver bandas y podio</button><button class="small-button" data-action="user-password" data-id="${user.id}" data-username="${esc(user.username)}">Contraseña</button><button class="small-button" data-action="user-access" data-id="${user.id}" data-username="${esc(user.username)}" data-active="${user.is_active}">${user.is_active ? "Deshabilitar" : "Habilitar"}</button><button class="small-button danger" data-action="user-delete" data-id="${user.id}" data-username="${esc(user.username)}" ${user.bands.length ? 'disabled title="No se puede eliminar: este jurado tiene bandas registradas. Deshabilita su acceso para conservar su evaluación."' : ""}>Eliminar</button></div>
   </article>`).join("");
   layout(`<main class="page-wrap"><div class="backline"><button class="back-button" data-action="back-home">← Volver al panel principal</button></div>
     <section class="hero" style="padding-top:8px"><div><div class="eyebrow">Administración de cuentas</div><h1>Usuarios</h1><p>Consulta las cuentas y las bandas creadas por cada jurado. No se muestran ni se almacenan contraseñas en este panel.</p></div><button class="primary-button" data-action="new-user">＋ Crear usuario</button></section>
@@ -412,7 +463,7 @@ function renderModal() {
   if (m.type === "new-user") body = `<form id="modal-form"><div class="field"><label for="modal-username">Nombre de usuario</label><input id="modal-username" name="username" minlength="3" maxlength="24" pattern="[a-zA-Z0-9._-]{3,24}" autocapitalize="none" required placeholder="ej. jurado01"></div><div class="field"><label for="modal-password">Contraseña inicial</label><input id="modal-password" name="password" type="password" minlength="10" required placeholder="Mínimo 10 caracteres"></div><div class="button-row"><button class="primary-button" type="submit">Crear cuenta</button><button class="secondary-button" type="button" data-action="close-modal">Cancelar</button></div></form>`;
   if (m.type === "password") body = `<form id="modal-form"><p class="muted" style="font-size:13px">Establece una nueva contraseña para <strong>${esc(m.username)}</strong>. La persona deberá utilizarla en su próximo inicio de sesión.</p><div class="field"><label for="modal-password">Nueva contraseña</label><input id="modal-password" name="password" type="password" minlength="10" required placeholder="Mínimo 10 caracteres"></div><div class="button-row"><button class="primary-button" type="submit">Actualizar contraseña</button><button class="secondary-button" type="button" data-action="close-modal">Cancelar</button></div></form>`;
   if (m.type === "confirm-access") body = `<p class="muted" style="font-size:13px">${m.active ? "¿Deseas deshabilitar" : "¿Deseas habilitar"} el acceso de <strong>${esc(m.username)}</strong>?</p><div class="button-row"><button class="primary-button" data-action="confirm-user-access">${m.active ? "Deshabilitar acceso" : "Habilitar acceso"}</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`;
-  if (m.type === "confirm-delete-user") body = `<div class="confirm-panel"><h3>Eliminar cuenta</h3><p>Se eliminará la cuenta de ${esc(m.username)}. Las bandas creadas por esta cuenta permanecerán en la clasificación, pero dejarán de tener usuario creador asociado.</p></div><div class="button-row"><button class="danger-button" data-action="confirm-delete-user">Eliminar cuenta</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`;
+  if (m.type === "confirm-delete-user") body = `<div class="confirm-panel"><h3>Eliminar cuenta</h3><p>Se eliminará la cuenta de ${esc(m.username)}. Esta operación sólo está permitida cuando no tiene bandas registradas. Para conservar evaluaciones existentes, deshabilita el acceso en lugar de eliminar la cuenta.</p></div><div class="button-row"><button class="danger-button" data-action="confirm-delete-user">Eliminar cuenta</button><button class="secondary-button" data-action="close-modal">Cancelar</button></div>`;
   app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal" style="max-width:480px"><div class="modal-head"><h2>${m.type === "new-user" ? "Crear usuario" : m.type === "password" ? "Cambiar contraseña" : m.type === "confirm-access" ? "Administrar acceso" : "Confirmar eliminación"}</h2><button class="modal-close" data-action="close-modal">×</button></div>${body}</section></div>`);
 }
 
@@ -420,8 +471,9 @@ function renderAward() {
   app.querySelectorAll(".modal-backdrop").forEach((node) => node.remove());
   const bands = sortedBands().slice(0, 3);
   const third = bands[2], second = bands[1], first = bands[0];
+  const juryLabel = isAdmin() ? selectedJuror()?.username : state.profile.username;
   const podiumSlot = (band, place, className, emoji) => `<div class="podium-slot ${className}" id="podium-${place}"><img class="podium-photo" src="${esc(band?.photo_url ?? "")}" alt="" onerror="this.style.opacity='0'"><div class="podium-name">${esc(band?.name ?? "Por definir")}</div><div class="podium-block">${emoji}</div></div>`;
-  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal podium-modal"><div class="award-subtitle">Festival Intercolegial · Resultados</div><h2>¡Llegó el momento de premiar!</h2><p>El podio se revela de menor a mayor posición.</p><div class="podium-stage">${podiumSlot(second, 2, "second", "2.º")}${podiumSlot(first, 1, "first", "1.º")}${podiumSlot(third, 3, "third", "3.º")}</div><div class="spin-note" id="award-caption">Preparando resultados…</div><div class="podium-actions"><button class="primary-button" data-action="close-award" disabled id="award-close">Cerrar ceremonia</button></div></section></div>`);
+  app.insertAdjacentHTML("beforeend", `<div class="modal-backdrop"><section class="modal podium-modal"><div class="award-subtitle">Festival Intercolegial · ${esc(juryLabel ? `Evaluación de ${juryLabel}` : "Resultados")}</div><h2>¡Llegó el momento de premiar!</h2><p>El podio de este jurado se revela de menor a mayor posición.</p><div class="podium-stage">${podiumSlot(second, 2, "second", "2.º")}${podiumSlot(first, 1, "first", "1.º")}${podiumSlot(third, 3, "third", "3.º")}</div><div class="spin-note" id="award-caption">Preparando resultados…</div><div class="podium-actions"><button class="primary-button" data-action="close-award" disabled id="award-close">Cerrar ceremonia</button></div></section></div>`);
   window.setTimeout(() => { document.getElementById("podium-3")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = third ? `Tercer lugar: ${third.name}` : "Tercer lugar"; }, 800);
   window.setTimeout(() => { document.getElementById("podium-2")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = second ? `Segundo lugar: ${second.name}` : "Segundo lugar"; }, 3900);
   window.setTimeout(() => { document.getElementById("podium-1")?.classList.add("revealed"); const caption = document.getElementById("award-caption"); if (caption) caption.textContent = first ? `¡Primer lugar: ${first.name}!` : "Primer lugar"; }, 7200);
@@ -456,7 +508,30 @@ async function loadProfile(user) {
   state.session = { user };
   state.profile = data;
   state.screen = "home";
+  state.selectedJurorId = null;
   await refreshData();
+  if (isAdmin()) {
+    try {
+      await fetchAdminUsers();
+    } catch (error) {
+      console.error("No se pudo cargar el listado administrativo; se intenta la lectura segura directa:", error);
+      const { data: users, error: usersError } = await supabase
+        .from("user_profiles")
+        .select("id, username, role, is_active, created_at")
+        .eq("role", "juror")
+        .order("username");
+      if (usersError) {
+        console.error("No se pudo cargar el panel por jurado:", usersError);
+        state.adminUsers = [];
+      } else {
+        state.adminUsers = (users ?? []).map((user) => ({
+          ...user,
+          bands: state.bands.filter((band) => band.created_by === user.id)
+            .map((band) => ({ id: band.id, name: band.name, created_at: band.created_at })),
+        }));
+      }
+    }
+  }
   return true;
 }
 
@@ -705,8 +780,11 @@ async function handleClick(event) {
   const action = actionNode.dataset.action;
   const id = actionNode.dataset.id;
   if (action === "new-band") openNewWizard();
-  else if (action === "open-band") { if (event.target.closest(".photo-edit")) return; state.selectedBandId = id; state.screen = "detail"; render(); }
+  else if (action === "open-band") { if (event.target.closest(".photo-edit")) return; if (!sortedBands().some((band) => band.id === id)) return; state.selectedBandId = id; state.screen = "detail"; render(); }
   else if (action === "back-home") { resetWizard(); state.modal = null; state.screen = "home"; render(); }
+  else if (action === "back-jurors") { state.selectedJurorId = null; state.selectedBandId = null; state.screen = "home"; render(); }
+  else if (action === "select-juror") { if (!isAdmin() || !state.adminUsers.some((user) => user.id === id)) return; state.selectedJurorId = id; state.selectedBandId = null; state.screen = "home"; render(); }
+  else if (action === "refresh-dashboard") { try { await refreshData(); await fetchAdminUsers(); renderHome(); showToast("Evaluaciones actualizadas."); } catch (error) { showToast(error.message, "error"); } }
   else if (action === "edit-band") openEditWizard(id);
   else if (action === "cancel-wizard") {
     const editingId = state.wizard?.id;
@@ -742,9 +820,9 @@ async function handleClick(event) {
   else if (action === "photo-confirm") { if (!state.wizard.photoPreview && !state.wizard.existingPhotoUrl) return; state.wizard.step = 1; renderWizard(); }
   else if (action === "save-band") saveWizard();
   else if (action === "go-delete") { state.screen = "delete"; render(); }
-  else if (action === "go-audit") { try { await fetchAuditLogs(); state.screen = "audit"; render(); } catch (error) { showToast(error.message, "error"); } }
-  else if (action === "go-users") { try { await fetchAdminUsers(); state.screen = "users"; render(); } catch (error) { showToast(error.message, "error"); } }
-  else if (action === "go-criteria") { state.screen = "criteria"; render(); }
+  else if (action === "go-audit") { try { state.selectedJurorId = null; await fetchAuditLogs(); state.screen = "audit"; render(); } catch (error) { showToast(error.message, "error"); } }
+  else if (action === "go-users") { try { state.selectedJurorId = null; await fetchAdminUsers(); state.screen = "users"; render(); } catch (error) { showToast(error.message, "error"); } }
+  else if (action === "go-criteria") { state.selectedJurorId = null; state.screen = "criteria"; render(); }
   else if (action === "logout") logout();
   else if (action === "quick-retake") { if (!isJuror()) return; state.quickRetake = { bandId: id, preview: "", blob: null, error: "", loading: true }; renderModal(); }
   else if (action === "quick-close") { stopCamera(); state.quickRetake = null; render(); }
@@ -758,7 +836,7 @@ async function handleClick(event) {
   else if (action === "close-modal") { state.modal = null; document.querySelector(".modal-backdrop")?.remove(); }
   else if (action === "user-password") { state.modal = { type: "password", id, username: actionNode.dataset.username }; renderModal(); }
   else if (action === "user-access") { state.modal = { type: "confirm-access", id, username: actionNode.dataset.username, active: actionNode.dataset.active === "true" }; renderModal(); }
-  else if (action === "user-delete") { state.modal = { type: "confirm-delete-user", id, username: actionNode.dataset.username }; renderModal(); }
+  else if (action === "user-delete") { const targetUser = state.adminUsers.find((user) => user.id === id); if (targetUser?.bands?.length) { showToast("No puedes eliminar una cuenta que conserva bandas. Deshabilita su acceso para mantener su evaluación.", "warning", 5000); return; } state.modal = { type: "confirm-delete-user", id, username: actionNode.dataset.username }; renderModal(); }
   else if (action === "confirm-user-access") {
     try { await callAdminAction({ action: "set_access", username: state.modal.username, is_active: !state.modal.active }); state.modal = null; await fetchAdminUsers(); await fetchAuditLogs(); renderUsers(); showToast("Permisos de acceso actualizados."); }
     catch (error) { showToast(error.message, "error"); }
