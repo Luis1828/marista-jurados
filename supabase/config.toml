@@ -1,0 +1,10 @@
+project_id = "REEMPLAZAR_CON_PROJECT_REF"
+
+[api]
+enabled = true
+
+[functions.admin-users]
+verify_jwt = true
+
+[functions.delete-band]
+verify_jwt = true
