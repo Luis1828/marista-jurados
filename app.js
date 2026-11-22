@@ -12,7 +12,10 @@ const supabase = validConfig ? createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
 const state = {
   session: null,
   profile: null,
-  screen: "login",
+  screen: "public",
+  publicResults: null,
+  publicLoading: false,
+  publicError: "",
   bands: [],
   criteria: [],
   adminUsers: [],
@@ -110,6 +113,291 @@ function tieWarningsHtml(groups) {
   }).join("")}</div>`;
 }
 const fmtDate = (value) => new Date(value).toLocaleString("es-BO", { dateStyle: "medium", timeStyle: "short" });
+
+// Normaliza mayúsculas, tildes, espacios y signos para reconocer variantes de escritura.
+function normalizePublicBandName(value) {
+  return String(value ?? "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]/g, "");
+}
+
+function editDistance(a, b) {
+  const rows = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    let previous = rows[0];
+    rows[0] = i;
+    for (let j = 1; j <= b.length; j += 1) {
+      const old = rows[j];
+      rows[j] = Math.min(
+        rows[j] + 1,
+        rows[j - 1] + 1,
+        previous + (a[i - 1] === b[j - 1] ? 0 : 1),
+      );
+      previous = old;
+    }
+  }
+  return rows[b.length];
+}
+
+function publicImageUrl(path) {
+  if (!path || !supabase) return "";
+  const { data } = supabase.storage.from("band-photos").getPublicUrl(path);
+  return data?.publicUrl ?? "";
+}
+
+function buildPublicStandings(payload) {
+  const entries = Array.isArray(payload?.entries) ? payload.entries : [];
+  const criteriaCount = Number(payload?.criteria_count) || 0;
+  const exactMap = new Map();
+  entries.forEach((entry) => {
+    const normalized = normalizePublicBandName(entry.name);
+    if (!normalized || criteriaCount < 1) return;
+    if (!exactMap.has(normalized)) exactMap.set(normalized, { normalized, entries: [], names: [] });
+    const group = exactMap.get(normalized);
+    group.entries.push(entry);
+    if (!group.names.includes(entry.name)) group.names.push(entry.name);
+  });
+
+  // Unir primero variantes exactas tras normalizar tildes, mayúsculas y signos.
+  const baseGroups = [...exactMap.values()];
+  const adjacency = baseGroups.map(() => []);
+  for (let i = 0; i < baseGroups.length; i += 1) {
+    for (let j = i + 1; j < baseGroups.length; j += 1) {
+      const a = baseGroups[i].normalized;
+      const b = baseGroups[j].normalized;
+      const distance = editDistance(a, b);
+      const minLength = Math.min(a.length, b.length);
+      const jurorsA = new Set(baseGroups[i].entries.map((entry) => String(entry.judge_key ?? "unknown")));
+      const jurorsB = new Set(baseGroups[j].entries.map((entry) => String(entry.judge_key ?? "unknown")));
+      const sameJurorEnteredBoth = [...jurorsA].some((key) => jurorsB.has(key));
+      if (distance === 1 && minLength >= 8 && !sameJurorEnteredBoth) {
+        adjacency[i].push({ index: j });
+        adjacency[j].push({ index: i });
+      }
+    }
+  }
+
+  const parent = baseGroups.map((_, index) => index);
+  const find = (value) => {
+    while (parent[value] !== value) {
+      parent[value] = parent[parent[value]];
+      value = parent[value];
+    }
+    return value;
+  };
+  const union = (a, b) => {
+    const rootA = find(a), rootB = find(b);
+    if (rootA !== rootB) parent[rootB] = rootA;
+  };
+  adjacency.forEach((neighbors, index) => {
+    if (neighbors.length !== 1) return;
+    const other = neighbors[0].index;
+    if (adjacency[other].length === 1 && adjacency[other][0].index === index) union(index, other);
+  });
+
+  const clustered = new Map();
+  baseGroups.forEach((group, index) => {
+    const root = find(index);
+    if (!clustered.has(root)) clustered.set(root, { entries: [], names: [], normalizedKeys: [] });
+    const target = clustered.get(root);
+    target.entries.push(...group.entries);
+    group.names.forEach((name) => { if (!target.names.includes(name)) target.names.push(name); });
+    target.normalizedKeys.push(group.normalized);
+  });
+
+  const reviewCandidates = [];
+  for (let i = 0; i < baseGroups.length; i += 1) {
+    for (let j = i + 1; j < baseGroups.length; j += 1) {
+      const a = baseGroups[i].normalized;
+      const b = baseGroups[j].normalized;
+      if (a.length < 6 || b.length < 6) continue;
+      const similarity = 1 - editDistance(a, b) / Math.max(a.length, b.length);
+      if (find(i) !== find(j) && similarity >= 0.72) {
+        reviewCandidates.push({ a: baseGroups[i].names[0], b: baseGroups[j].names[0], similarity });
+      }
+    }
+  }
+
+  const standings = [...clustered.values()].map((group) => {
+    // Un jurado cuenta una sola vez por banda. Si escribió una variante más de
+    // una vez, primero se promedian sus entradas dentro de ese mismo jurado.
+    const totalsByJuror = new Map();
+    const criteriaByJuror = new Map();
+    group.entries.forEach((entry) => {
+      const judgeKey = String(entry.judge_key ?? "unknown");
+      const total = Number(entry.score_total) / criteriaCount;
+      if (Number.isFinite(total)) {
+        if (!totalsByJuror.has(judgeKey)) totalsByJuror.set(judgeKey, []);
+        totalsByJuror.get(judgeKey).push(total);
+      }
+      if (!criteriaByJuror.has(judgeKey)) criteriaByJuror.set(judgeKey, new Map());
+      const jurorCriteria = criteriaByJuror.get(judgeKey);
+      (Array.isArray(entry.criterion_scores) ? entry.criterion_scores : []).forEach((item) => {
+        const label = String(item?.label ?? "").trim();
+        const value = Number(item?.score);
+        if (!label || !Number.isFinite(value)) return;
+        if (!jurorCriteria.has(label)) jurorCriteria.set(label, []);
+        jurorCriteria.get(label).push(value);
+      });
+    });
+    const judgeAverages = [...totalsByJuror.values()].map((values) => values.reduce((sum, value) => sum + value, 0) / values.length);
+    const average = judgeAverages.length
+      ? judgeAverages.reduce((sum, value) => sum + value, 0) / judgeAverages.length
+      : 0;
+
+    const criterionLabels = new Map();
+    (payload?.criteria ?? []).forEach((item) => {
+      if (item?.label) criterionLabels.set(String(item.label), Number(item.sort_order) || 0);
+    });
+    const criteria = [...criterionLabels.entries()].map(([label, sortOrder]) => {
+      const jurorValues = [];
+      criteriaByJuror.forEach((jurorCriteria) => {
+        const values = jurorCriteria.get(label);
+        if (values?.length) jurorValues.push(values.reduce((sum, value) => sum + value, 0) / values.length);
+      });
+      const criterionAverage = jurorValues.length
+        ? jurorValues.reduce((sum, value) => sum + value, 0) / jurorValues.length
+        : 0;
+      return { label, sort_order: sortOrder, average: criterionAverage, jurorCount: jurorValues.length };
+    }).sort((a, b) => a.sort_order - b.sort_order || a.label.localeCompare(b.label, "es"));
+
+    const nameFrequency = new Map();
+    group.entries.forEach((entry) => nameFrequency.set(entry.name, (nameFrequency.get(entry.name) ?? 0) + 1));
+    const nameQuality = (value) => {
+      const capitals = (String(value).match(/[A-ZÁÉÍÓÚÜÑ]/g) ?? []).length;
+      const punctuation = (String(value).match(/[^\p{L}\p{N}\s]/gu) ?? []).length;
+      return capitals - punctuation * 2;
+    };
+    const displayName = [...nameFrequency.entries()]
+      .sort((a, b) => b[1] - a[1] || nameQuality(b[0]) - nameQuality(a[0]) || a[0].localeCompare(b[0], "es"))[0]?.[0] ?? group.names[0] ?? "Banda";
+
+    const notes = [...new Set(group.entries.map((entry) => String(entry.notes ?? "").trim()).filter(Boolean))];
+    const photoMap = new Map();
+    group.entries.forEach((entry) => {
+      const path = String(entry.photo_path ?? "").trim();
+      if (!path) return;
+      const existing = photoMap.get(path);
+      const timestamp = entry.updated_at ? new Date(entry.updated_at).getTime() : 0;
+      if (!existing || timestamp > existing.timestamp) {
+        photoMap.set(path, { path, timestamp, url: publicImageUrl(path) });
+      }
+    });
+    const photos = [...photoMap.values()].sort((a, b) => b.timestamp - a.timestamp);
+
+    return {
+      name: displayName,
+      aliases: [...new Set(group.names)].filter((name) => name !== displayName),
+      average,
+      jurorCount: totalsByJuror.size,
+      autoMatched: group.normalizedKeys.length > 1,
+      criteria,
+      notes,
+      photos,
+      photoUrl: photos[0]?.url ?? "",
+    };
+  }).sort((a, b) => b.average - a.average || a.name.localeCompare(b.name, "es"));
+
+  let previousAverage = null;
+  let currentRank = 0;
+  standings.forEach((item, index) => {
+    if (previousAverage === null || Math.abs(item.average - previousAverage) > 1e-9) currentRank = index + 1;
+    item.rank = currentRank;
+    previousAverage = item.average;
+    item.tied = standings.filter((other) => Math.abs(other.average - item.average) <= 1e-9).length > 1;
+  });
+
+  reviewCandidates.sort((a, b) => b.similarity - a.similarity);
+  return {
+    standings,
+    reviewCandidates: reviewCandidates.slice(0, 6),
+    incompleteCount: Number(payload?.incomplete_count) || 0,
+    participatingJurors: Number(payload?.jurors_count) || 0,
+  };
+}
+
+function publicBandDetailsHtml(band) {
+  const photos = band.photos?.length
+    ? `<div class="public-photo-gallery">${band.photos.map((photo, index) => `<img src="${esc(photo.url)}" alt="Fotografía ${index + 1} de ${esc(band.name)}" loading="lazy">`).join("")}</div>`
+    : `<div class="public-no-photo">No se registró fotografía.</div>`;
+  const radarCriteria = (band.criteria ?? []).map((item, index) => ({ id: item.label, label: item.label, sort_order: index }));
+  const radarScores = Object.fromEntries((band.criteria ?? []).map((item) => [item.label, item.average]));
+  const skills = (band.criteria ?? []).map((item) => `<div class="public-skill-row"><span>${esc(item.label)}</span><strong>${item.average.toFixed(2)} / 5</strong></div>`).join("");
+  const notes = band.notes?.length
+    ? band.notes.map((note) => `<p>${esc(note)}</p>`).join("")
+    : `<p>No se registraron comentarios adicionales.</p>`;
+  return `<details class="public-band-details"><summary>Ver fotografías, habilidades y comentarios</summary>
+    <div class="public-detail-grid">
+      <section class="public-detail-section"><h4>Fotografías de la banda</h4>${photos}</section>
+      <section class="public-detail-section"><h4>Habilidades consolidadas</h4><div class="public-radar-wrap">${radarSvg(radarScores, radarCriteria, true)}</div><div class="public-skill-list">${skills}</div></section>
+      <section class="public-detail-section public-notes-section"><h4>Comentarios y notas</h4>${notes}</section>
+    </div>
+  </details>`;
+}
+
+async function loadPublicResults() {
+  if (!supabase) return;
+  state.publicLoading = true;
+  state.publicError = "";
+  renderPublicHome();
+  const { data, error } = await supabase.rpc("get_public_festival_results");
+  state.publicLoading = false;
+  if (error) {
+    console.error("No se pudieron cargar los resultados públicos:", error);
+    state.publicError = "No se pudieron cargar los resultados. Comprueba que se haya aplicado la migración de resultados públicos en Supabase.";
+    state.publicResults = null;
+  } else {
+    state.publicResults = data ?? { entries: [], criteria_count: 0 };
+  }
+  renderPublicHome();
+}
+
+function renderPublicHome() {
+  if (!validConfig) {
+    render();
+    return;
+  }
+  const result = buildPublicStandings(state.publicResults);
+  // Si hay varios empatados dentro de los tres primeros puestos, se muestran todos.
+  const leaders = result.standings.filter((band) => band.rank <= 3);
+  const podiumMarkup = leaders.length
+    ? `<div class="public-podium-grid">${leaders.map((band) => {
+        const medal = band.rank === 1 ? "🥇" : band.rank === 2 ? "🥈" : "🥉";
+        const rankLabel = band.tied ? `Puesto ${band.rank} · EMPATE` : `${medal} Puesto ${band.rank}`;
+        const cover = band.photoUrl
+          ? `<img class="public-podium-cover" src="${esc(band.photoUrl)}" alt="Fotografía de ${esc(band.name)}" loading="lazy">`
+          : `<div class="public-podium-cover public-photo-placeholder">♫</div>`;
+        return `<article class="public-podium-card place-${Math.min(band.rank, 3)}">${cover}<div class="public-podium-medal">${medal}</div><div class="public-podium-rank">${rankLabel}</div><h3>${esc(band.name)}</h3><strong class="public-podium-score">${band.average.toFixed(2)} <small>/ 5</small></strong><span class="public-podium-judges">${band.jurorCount} ${band.jurorCount === 1 ? "jurado evaluó" : "jurados evaluaron"} esta banda</span>${band.aliases.length ? `<small class="public-aliases">También registrada como: ${band.aliases.map(esc).join(" · ")}</small>` : ""}${publicBandDetailsHtml(band)}</article>`;
+      }).join("")}</div>`
+    : `<div class="public-empty"><div class="public-empty-icon">♫</div><h2>Aún no hay resultados disponibles</h2><p>Cuando los jurados registren y completen sus evaluaciones, aquí aparecerá la clasificación consolidada del festival.</p></div>`;
+
+  const rows = result.standings.map((band) => {
+    const thumbnail = band.photoUrl
+      ? `<img class="public-standing-thumb" src="${esc(band.photoUrl)}" alt="" loading="lazy">`
+      : `<div class="public-standing-thumb public-photo-placeholder">♫</div>`;
+    return `<div class="public-standing-item"><article class="public-standing-row">${thumbnail}<div class="public-standing-rank ${band.rank <= 3 ? `rank-${band.rank}` : ""}">${band.tied ? `⚖ ${band.rank}` : band.rank}</div><div class="public-standing-main"><strong>${esc(band.name)}</strong>${band.aliases.length ? `<small>Variantes: ${band.aliases.map(esc).join(" · ")}</small>` : ""}${band.autoMatched ? `<span class="public-match-tag">Nombres similares unificados</span>` : ""}</div><div class="public-standing-judges">${band.jurorCount} ${band.jurorCount === 1 ? "jurado" : "jurados"}</div><strong class="public-standing-score">${band.average.toFixed(2)} / 5 ${band.tied ? `<small>EMPATE</small>` : ""}</strong></article>${publicBandDetailsHtml(band)}</div>`;
+  }).join("");
+
+  const candidateMarkup = result.reviewCandidates.length
+    ? `<section class="public-review-note"><strong>Posibles nombres similares para revisar</strong><p>Estos nombres se parecen, pero no se combinaron automáticamente porque la coincidencia no es suficientemente segura. Se mantienen separados para evitar unir bandas distintas.</p><ul>${result.reviewCandidates.map((pair) => `<li>${esc(pair.a)} <span>↔</span> ${esc(pair.b)}</li>`).join("")}</ul><small>Los casos dudosos se mantienen separados hasta verificar que se trata de la misma banda.</small></section>`
+    : "";
+
+  app.innerHTML = `<div class="public-shell">
+    <header class="public-topbar"><div class="brand"><div class="brand-symbol">M</div><div class="brand-copy"><strong>FESTIVAL MARISTA</strong><span>Intercolegial</span></div></div><button class="public-login-button" data-action="open-login">Iniciar sesión para jurados <span>→</span></button></header>
+    <main class="public-wrap">
+      <section class="public-hero"><div class="public-kicker">COLEGIO MARISTA · FESTIVAL INTERCOLEGIAL</div><h1>El talento se encuentra en el escenario.</h1><p>Resultados generales · Evaluación consolidada de los jurados</p><div class="public-hero-meta"><span>✦ ${result.participatingJurors} ${result.participatingJurors === 1 ? "jurado participante" : "jurados participantes"}</span><span>♬ ${result.standings.length} ${result.standings.length === 1 ? "banda" : "bandas"} clasificadas</span></div></section>
+      ${state.publicLoading ? `<div class="public-status">Cargando resultados del festival…</div>` : ""}
+      ${state.publicError ? `<div class="public-error"><strong>No se pudieron cargar los resultados</strong><p>${esc(state.publicError)}</p><button class="secondary-button" data-action="refresh-public-results">Reintentar</button></div>` : ""}
+      ${!state.publicError && !state.publicLoading ? `<section class="public-section"><div class="public-section-heading"><div><span>LOS GANADORES</span><h2>Podio general</h2></div><button class="public-refresh-button" data-action="refresh-public-results">↻ Actualizar</button></div>${podiumMarkup}</section>
+      ${result.standings.length ? `<section class="public-section public-full-ranking"><div class="public-section-heading"><div><span>TODAS LAS BANDAS</span><h2>Clasificación completa</h2></div><small>Promedios consolidados y fichas públicas</small></div><div class="public-standing-list">${rows}</div></section>` : ""}
+      ${candidateMarkup}
+      ${result.incompleteCount > 0 ? `<p class="public-incomplete-note">${result.incompleteCount} ${result.incompleteCount === 1 ? "evaluación no participa" : "evaluaciones no participan"} en el cálculo porque todavía no tiene todos los criterios activos calificados.</p>` : ""}
+      <p class="public-matching-note">Se muestran las fotografías, habilidades consolidadas y notas registradas por los jurados. Los nombres se normalizan para detectar variantes; las coincidencias dudosas permanecen separadas.</p></section>` : ""}
+      <footer class="public-footer">Festival Intercolegial · Colegio Marista <span>Resultados públicos</span></footer>
+    </main>
+  </div>`;
+}
 
 function showToast(message, type = "success", duration = 3600) {
   const element = document.createElement("div");
@@ -235,6 +523,7 @@ function headerHtml() {
     <div class="brand"><div class="brand-symbol">M</div><div class="brand-copy"><strong>FESTIVAL MARISTA</strong><span>Panel de jurados</span></div></div>
     <div class="top-actions">
       <span class="user-chip">${esc(state.profile.username)} · ${isAdmin() ? "Admin" : "Jurado"}</span>
+      <button class="top-link small-hide" data-action="open-public-view">Resultados</button>
       ${isAdmin() ? `<button class="top-link" data-action="go-users">Usuarios</button><button class="top-link" data-action="go-criteria">Criterios</button>` : `<button class="top-link" data-action="go-delete">Eliminar</button>`}
       <button class="icon-button" title="Registro de actividad" aria-label="Registro de actividad" data-action="go-audit">▤</button>
       <button class="icon-button" title="Cerrar sesión" aria-label="Cerrar sesión" data-action="logout">↪</button>
@@ -260,8 +549,8 @@ function renderLogin(error = "") {
       <div class="login-tag">Sistema oficial de evaluación</div><h1>El talento merece una buena evaluación.</h1><p>Plataforma privada para los jurados del Festival Intercolegial del Colegio Marista.</p></div>
       <footer>Acceso exclusivo para personal autorizado · 2026</footer>
     </section>
-    <section class="login-panel"><form class="login-box" id="login-form">
-      <h2>Bienvenido</h2><p>Ingresa con el usuario y contraseña asignados.</p>
+    <section class="login-panel"><button class="login-back-public" type="button" data-action="public-home">← Volver a resultados</button><form class="login-box" id="login-form">
+      <h2>Acceso para jurados</h2><p>Ingresa con el usuario y contraseña asignados.</p>
       ${error ? `<div class="form-error">${esc(error)}</div>` : ""}
       <div class="field"><label for="login-username">Usuario</label><input id="login-username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required maxlength="24" placeholder="Tu usuario" data-autofocus></div>
       <div class="field"><label for="login-password">Contraseña</label><input id="login-password" name="password" type="password" autocomplete="current-password" required placeholder="Tu contraseña"></div>
@@ -586,7 +875,11 @@ function render() {
     app.innerHTML = `<main class="login-page"><section class="login-art"><div><div class="login-tag">Festival Intercolegial Marista</div><h1>Configuración pendiente.</h1><p>La interfaz está preparada, pero todavía debes conectar el proyecto con tu backend Supabase.</p></div><footer>Consulta README.md dentro del proyecto.</footer></section><section class="login-panel"><div class="login-box"><h2>Conecta Supabase</h2><p>Abre <strong>config.js</strong> y reemplaza los dos valores de ejemplo por la URL de tu proyecto y su clave publishable/anon. Nunca pegues la secret/service role key aquí.</p></div></section></main>`;
     return;
   }
-  if (!state.profile) { renderLogin(); return; }
+  if (!state.profile) {
+    if (state.screen === "login") renderLogin();
+    else renderPublicHome();
+    return;
+  }
   if (state.screen === "home") renderHome();
   else if (state.screen === "detail") renderBandDetail();
   else if (state.screen === "wizard") renderWizard();
@@ -697,8 +990,8 @@ async function login(form) {
 async function logout() {
   stopCamera(); resetWizard(); state.quickRetake = null; state.modal = null;
   await supabase.auth.signOut();
-  state.profile = null; state.session = null; state.screen = "login";
-  renderLogin();
+  state.profile = null; state.session = null; state.screen = "public";
+  await loadPublicResults();
 }
 
 function openNewWizard() {
@@ -919,7 +1212,14 @@ async function handleClick(event) {
   if (!actionNode) return;
   const action = actionNode.dataset.action;
   const id = actionNode.dataset.id;
-  if (action === "new-band") openNewWizard();
+  if (action === "open-login") { state.screen = "login"; renderLogin(); }
+  else if (action === "public-home") {
+    if (state.profile) await logout();
+    else { state.screen = "public"; await loadPublicResults(); }
+  }
+  else if (action === "open-public-view") await logout();
+  else if (action === "refresh-public-results") await loadPublicResults();
+  else if (action === "new-band") openNewWizard();
   else if (action === "open-band") { if (event.target.closest(".photo-edit")) return; if (!sortedBands().some((band) => band.id === id)) return; state.selectedBandId = id; state.screen = "detail"; render(); }
   else if (action === "back-home") { resetWizard(); state.modal = null; state.screen = "home"; render(); }
   else if (action === "back-jurors") { state.selectedJurorId = null; state.selectedBandId = null; state.screen = "home"; render(); }
@@ -1063,12 +1363,15 @@ async function init() {
   if (session?.user) {
     const ok = await loadProfile(session.user);
     if (ok) render();
-    else renderLogin();
-  } else renderLogin();
+    else { state.screen = "public"; await loadPublicResults(); }
+  } else {
+    state.screen = "public";
+    await loadPublicResults();
+  }
   supabase.auth.onAuthStateChange((event, sessionNow) => {
     if (event === "SIGNED_OUT") {
-      state.session = null; state.profile = null; state.screen = "login";
-      renderLogin();
+      state.session = null; state.profile = null; state.screen = "public";
+      loadPublicResults().catch((error) => console.error("No se pudieron cargar resultados públicos:", error));
     }
     if (event === "TOKEN_REFRESHED" && sessionNow) state.session = sessionNow;
   });
@@ -1076,5 +1379,7 @@ async function init() {
 
 init().catch((error) => {
   console.error(error);
-  renderLogin("No se pudo iniciar la aplicación. Verifica la conexión con Supabase y vuelve a cargar.");
+  state.screen = "public";
+  state.publicError = "No se pudo iniciar la aplicación. Verifica la conexión con Supabase y vuelve a cargar.";
+  renderPublicHome();
 });
